@@ -1,0 +1,536 @@
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+/* Lets create a table with raw data and then perform data quality checks. */
+
+create external table if not exists ny_taxi_raw(vendorid int, tpep_pickup_datetime timestamp, tpep_dropoff_datetime timestamp, passenger_count int, trip_distance double,
+ratecoteid int, store_forward_flag string, pulocationid int, dolocationid int, payment_type int, fare_amount double, extra double,
+mta_tax double, tip_amount double, tolls_charge double, improvement_surcharge double, total_charge double)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+location '/common_folder/nyc_taxi_data/'
+tblproperties ("skip.header.line.count"="2");
+
+
+/* Basic Data Quality Checks */
+
+
+/* How many records has each TPEP provider provided? */
+
+SELECT vendorid, 
+       Count(vendorid) AS total_trips 
+FROM   ny_taxi_raw 
+GROUP  BY vendorid 
+ORDER  BY total_trips DESC;
+
+/* RESULT: There are 10345930 records for Vendor 2 
+           There are 8447149 records for Vendor 1  */
+
+/* Lets go through each column and perform quality checks as per the data dictionary. */
+ 
+
+/* Verify if the pickup date is between the date range from Nov'17 to Dec'17. */
+
+SELECT Count(*) AS pickup_date_records_outofrange
+FROM   ny_taxi_raw 
+WHERE  tpep_pickup_datetime NOT LIKE '%2017-11%' 
+       AND tpep_pickup_datetime NOT LIKE '%2017-12%';
+
+/* RESULT: 315 records for pickupdate are out of the date range specified in data dictionary that is  */
+
+
+/* Verify if the dropoff date is between the date range from Nov'17 to Dec'17. */
+
+SELECT Count(*) AS dropoff_date_records_outofrange
+FROM   ny_taxi_raw
+WHERE  tpep_dropoff_datetime NOT LIKE '%2017-11%' 
+       AND tpep_dropoff_datetime NOT LIKE '%2017-12%';
+    
+/* RESULT: 1907 records for dropoff_date are out of the date range specified in data dictionary. All these are error records*/
+
+
+
+/* Lets Verify if the Pickup time is greater than the Dropoff time. */
+
+SELECT Count(*) AS error_date_records 
+FROM   ny_taxi_raw 
+WHERE  tpep_pickup_datetime > tpep_dropoff_datetime;
+
+/* RESULT: 1419 records has pickupdate higher than that of dropoff time. These are incorrect records */
+
+
+/* Lets see the min, max and avg passenger count per trip. */
+
+
+SELECT Min(passenger_count) AS min_passenger_count,
+       Max(passenger_count) As max_passenger_count, 
+       Avg(passenger_count) AS avg_passenger_count 
+FROM   ny_taxi_raw;
+
+/*
+    min_passenger_count	max_passenger_count	avg_passenger_count
+ 	
+1	0	                192	                1.62178619054387
+*/
+
+
+SELECT passenger_count, 
+       Count(*) AS no_of_records 
+FROM   ny_taxi_raw 
+GROUP  BY passenger_count 
+ORDER  BY passenger_count;
+
+/*    The min and max passenger count doesnt look right. Trips with 0 passenger is invalid record.
+    Also as per new york taxi rules maximum passenger count allowed is 4 or 5 based on car type and 6 incase of child
+    So we will consider the records with passenger count less than or equal to 6
+    There are 108970 records with ZERO number of passengers and 1 record with 192 number of passengers.*/
+
+
+/* Lets looks at the min, max and avg distance of a trip */
+
+SELECT Min(trip_distance) AS min_distance, 
+       Max(trip_distance) AS max_distance, 
+       Round(Avg(trip_distance),2) AS avg_distance 
+FROM   ny_taxi_raw;
+
+/*
+min_distance	max_distance	avg_distance
+ 	
+	0	        702.5	        2.87
+	
+-- 0 and 702 miles looks incorrect distance.
+*/
+
+/* Lets calculate the time it took to travel the 702 miles */
+SELECT trip_distance,
+       round(trip_distance/(unix_timestamp(tpep_dropoff_datetime)/3600 - unix_timestamp(tpep_pickup_datetime)/3600),2) AS speed_in_mph,
+       round((unix_timestamp(tpep_dropoff_datetime)/3600 - unix_timestamp(tpep_pickup_datetime)/3600),2) AS trip_duration_in_hours
+FROM   ny_taxi_raw
+WHERE  trip_distance = 702.5;
+
+/* RESULT: 
+trip_distance	speed_in_mph	trip_duration_in_hours
+ 	702.5	       2356.94	            0.3
+
+-- 702 miles in 18 minutes with 2350 mph speed is definitely a symptom of error records in trip_distance col. */
+
+
+
+
+/* Now lets move onto check pickup location id's and drop off location ids.
+/* As per https://geo.nyu.edu/catalog/nyu-2451-36743 there are 265 region id's*/
+
+SELECT Count(DISTINCT pulocationid) AS no_of_pickup_locations 
+FROM   ny_taxi_raw;
+-- 264
+
+SELECT Count(distinct dolocationid) AS no_of_dropoff_locations
+FROM   ny_taxi_raw;
+-- 265
+
+/* Data looks correct */
+
+
+
+/* Lets move on to check the distinct rate codes */
+
+SELECT DISTINCT( ratecoteid ) AS ratecoteid 
+FROM   ny_taxi_raw;
+
+/* incorrect ratecoteid 99 as per the data dictionary. We have only 6 codes. We have to filter records */
+
+/* Lets move onto check The store_forward_flag */
+
+SELECT DISTINCT( store_forward_flag ) AS store_forward_flag 
+FROM   ny_taxi_raw; 
+
+/* RESULT: Data looks correct
+
+/* Lets check the The payment_type column */
+SELECT DISTINCT( payment_type ) AS payment_type 
+FROM   ny_taxi_raw; 
+
+/* RESULT: holds right values(1:4) as specified in the dictionary. */
+
+
+
+/* Lets take a look at min, max and avg fare amount per trip */
+
+SELECT Min(fare_amount) AS min_fare, 
+       Max(fare_amount) AS max_fare, 
+       Avg(fare_amount) AS avg_fare 
+FROM   ny_taxi_raw;
+
+/* RESULT
+        min_fare	max_fare	avg_fare
+ 	
+        -499	    393221.5	13.036807536434036
+
+        -- Min and Max fare doesnt look right. 
+        -- Negative amount and over 39322$ of fare amount doesnt sound right. */
+
+
+/* Lets move on to verifying the extra charge column */
+ 
+SELECT Count(extra) AS extra_tax_error_records 
+FROM   ny_taxi_raw 
+WHERE  extra NOT IN ( 0, 0.5, 1 );
+
+/* RESULT:
+        
+-- As described in the data dictionary, extra charges and surcharges are levied only during rush hours or overnight with 0.5$ or 1$
+-- Lets get the number of records with extra charged levied other than 0, 0.5 or 1$.
+-- 78260 records */
+
+
+
+/* Lets get the number of records which has MTA tax value other than 0 or 0.5.*/
+
+SELECT Count(mta_tax) AS mta_tax_error_records 
+FROM   ny_taxi_raw 
+WHERE  mta_tax NOT IN ( 0, 0.5 );
+
+/* RESULT
+    -- 9136 records with MTA tax other than 0 or 0.5$ we will have to filter these records while creating partitioned table*/
+    
+
+
+/* Lets get the number of records which has improvement charge value other than 0 or 0.3.*/
+
+SELECT Count(improvement_surcharge) AS improvement_charge_error_records 
+FROM   ny_taxi_raw 
+WHERE  improvement_surcharge NOT IN ( 0, 0.3 )
+
+/* RESULT
+    -- 9413 records with improvement charges other than 0 and 0.3$
+
+
+
+/* Lets see the statistical values of the column tip amount */
+
+SELECT Min(tip_amount) AS min_tip_amount, 
+       Max(tip_amount) AS max_tip_amount, 
+       Avg(tip_amount) AS avg_tip_amount 
+FROM   ny_taxi_raw;
+       
+/* REESULT
+
+min_tip_amount	max_tip_amount	avg_tip_amount
+ 	
+1	-218	        496	        1.8506449539221366
+-- Records with Negative tip amount doesnt look right. These have to be filtered */
+
+
+    
+
+/*  Lets see the min, max and avg values for the tolls_charge */
+
+
+SELECT Min(tolls_charge) AS min_toll_charge, 
+       Max(tolls_charge) AS max_toll_charge, 
+       Avg(tolls_charge) AS avg_toll_charge 
+FROM   ny_taxi_raw;
+
+/* RESULT
+min_toll_charge	max_toll_charge	avg_toll_charge
+ 	
+-19	               1018.95	    0.327590892903032
+
+    -- Negative toll charges doesnt look right. We will have to filter the negative values. */
+
+
+/* Lets see the over all min, max and avg trip cost */
+
+
+SELECT Min(total_charge) AS min_total, 
+       Max(total_charge) AS max_total, 
+       Avg(total_charge) AS avg_total 
+FROM   ny_taxi_raw;
+
+/* RESULT
+
+min_total	max_total	avg_total
+ 	
+-499.3	    393222.32	16.335113467271523
+
+    -- Negative total charge is not a valid record. Lets clean the records with negative values. */
+
+/* Lets answer the question "which vendor is doing a bad job in providing the records using different columns of the dataset? " */
+
+SELECT vendorid, 
+       Count(*) AS error_records 
+FROM   ny_taxi_raw 
+WHERE  ( Year(tpep_pickup_datetime) != 2017 
+          OR Month(tpep_pickup_datetime) NOT IN ( 11, 12 ) 
+          OR Year(tpep_dropoff_datetime) != 2017 
+          OR Month(tpep_dropoff_datetime) NOT IN ( 11, 12 ) 
+          OR tpep_pickup_datetime > tpep_dropoff_datetime 
+          OR passenger_count NOT BETWEEN 1 AND 6 
+          OR trip_distance <= 0.0 
+          OR ratecoteid NOT BETWEEN 1 AND 6 
+          OR payment_type NOT BETWEEN 1 AND 6 
+          OR fare_amount <= 0 
+          OR extra NOT IN ( 0, 0.5, 1 ) 
+          OR mta_tax NOT IN ( 0, 0.5 ) 
+          OR tip_amount < 0.0 
+          OR ( payment_type = 2 
+               AND tip_amount != 0 ) 
+          OR tolls_charge < 0.0 
+          OR improvement_surcharge NOT IN ( 0, 0.3 ) 
+          OR total_charge <= 0 ) 
+GROUP  BY vendorid 
+ORDER  BY error_records DESC;
+
+/* vendorid	    error_records
+ 	
+	1	        208405
+	2	        103192
+
+It is very evident that Vendor 1 is doing a very bad job in providing the records. */
+
+
+/*Summary of the data quality checks:
+
+	1) Pickup time is higher or later than the dropoff time
+	2) There are records which are out of the date range specified in the data dictionary in both the pickup and dropoff columns. i.e Nov'17 and Dec'17
+	3) Some records have passenger count as zero or over 6 which is max limit allowed in NY taxi
+	4) Incorrect trip distance recorded. Some records has 0 and some of them over 700 miles.
+	5) Incorrect ratecoteid 99 as per the data dictionary. We have only 6 codes.
+	6) Negative amount and over 39322$ of fare amount doesnt sound right.
+	7) 78260 records with extra charged levied other than 0, 0.5 or 1$.
+	8) 9136 records with MTA tax other than 0 or 0.5$ as specified in data dict.
+	9) 9413 records with improvement tax other than 0 or 0.3$
+	10) Negative Tip amount (-218$ ) doesnt look right
+	11) Negative Tip amount (-19$ ) doesnt look right
+	12) Negative total amount doesnt look right. 
+	13) Vendor 1 is doing pretty bad job in submitting the right details. 
+	14) As we have millions of records, the outliers value will have a min impact on the statsictical values. so ignoring outliers */
+
+
+/* Lets move on creating partitioned table. We will do partition on month and day of the month.
+/* Lets now create partitioned table with removing error data */
+
+
+
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+/* Create Partitioned table and insert records with filters to remove the rows with incorrect data that we identified above in data quality checks. */
+
+create external table if not exists ny_taxi_processed_orc
+(vendorid int, tpep_pickup_datetime timestamp, tpep_dropoff_datetime timestamp, passenger_count int, trip_distance double,
+ratecoteid int, store_forward_flag string, pulocationid int, dolocationid int, payment_type int, fare_amount double, extra double,
+mta_tax double, tip_amount double, tolls_charge double, improvement_surcharge double, total_charge double) partitioned by (mnth int, day_of_mnth int)
+stored as orc location '/user/hive/warehouse/ny_taxi_prb_part'
+tblproperties ("orc.compress"="SNAPPY");
+
+/* Insert Cleaned data */
+
+INSERT overwrite TABLE ny_taxi_processed_orc partition 
+       ( 
+              mnth, 
+              day_of_mnth 
+       ) 
+SELECT vendorid, 
+       tpep_pickup_datetime, 
+       tpep_dropoff_datetime, 
+       passenger_count, 
+       trip_distance, 
+       ratecoteid, 
+       store_forward_flag, 
+       pulocationid, 
+       dolocationid, 
+       payment_type, 
+       fare_amount, 
+       extra, 
+       mta_tax, 
+       tip_amount, 
+       tolls_charge, 
+       improvement_surcharge, 
+       total_charge, 
+       month(tpep_pickup_datetime) AS mnth, 
+       day(tpep_pickup_datetime)   AS day_of_mnth 
+FROM   ny_taxi_raw 
+WHERE  year(tpep_pickup_datetime)= 2017 
+AND    month(tpep_pickup_datetime) IN (11,12) 
+AND    year(tpep_dropoff_datetime)= 2017 
+AND    month(tpep_dropoff_datetime) IN (11,12) 
+AND    tpep_pickup_datetime < tpep_dropoff_datetime 
+AND    ( passenger_count BETWEEN 1 AND 6) 
+AND    trip_distance > 0 
+AND    ( ratecoteid BETWEEN 1 AND 6) 
+AND    ( payment_type BETWEEN 1 AND 6) 
+AND    fare_amount > 0 
+AND    extra IN (0, 0.5, 1) 
+AND    mta_tax IN (0, 0.5) 
+AND    tip_amount >= 0 
+AND    tolls_charge >= 0 
+AND    improvement_surcharge IN (0, 0.3) 
+AND    total_charge > 0;
+    
+    
+/*
+SELECT count(*) FROM ny_taxi_processed_orc; Returns 18480967 rows.
+*/
+
+
+/* LETS MOVE ONTO ANALYSING THE DATA */
+/* Analysis 1 */
+
+/* 1) Compare the overall average fare per trip for November and December. */
+
+/* Using round function to round avg fare amount to 2 decimal values */
+
+SELECT mnth, 
+       Round(Avg(fare_amount), 2) AS overall_avg_fare 
+FROM   ny_taxi_processed_orc 
+GROUP  BY mnth 
+ORDER  BY mnth;
+
+/* mnth	overall_avg_fare
+ 	
+1	11	12.9
+2	12	12.75
+--12.9 avg for month of Novemeber and 12.75 for December. Novemeber has slightly higher avergare trip fare
+
+
+/* 2) Explore the ‘number of passengers per trip’ - 
+      how many trips are made by each level of ‘Passenger_count’? 
+      Do most people travel solo or with other people? */
+   
+SELECT passenger_count, 
+       Count(*) AS no_of_rides 
+FROM   ny_taxi_processed_orc 
+GROUP  BY passenger_count 
+ORDER  BY no_of_rides DESC;
+
+/* From the results it is clear that people travel solo in most of the cases.
+    passenger_count	no_of_rides
+ 	
+1	    1	        13102523
+2	    2	        2785290
+3	    5	        868304                           */
+
+
+/* 3) Which is the most preferred mode of payment? */
+
+SELECT payment_type, 
+       Count(*) AS no_of_payments 
+FROM   ny_taxi_processed_orc 
+GROUP  BY payment_type 
+ORDER  BY no_of_payments DESC;
+
+/*    payment_type	no_of_payments
+ 	
+1	    1	        12469337
+2	    2	        5914388
+3	    3	        75884
+4	    4	        21358
+
+/* Credit cards are the most preferred method for the payments */
+
+
+
+/* 4) What is the average tip paid per trip? 
+      Compare the average tip with the 25th, 50th and 75th percentiles and comment whether the ‘average tip’ is a representative statistic (of the central tendency) of ‘tip amount paid’ */ 
+
+SELECT Round(Avg(tip_amount), 2)           AS avg_tip, 
+       Percentile_approx(tip_amount, 0.25) AS first_quart, 
+       Percentile_approx(tip_amount, 0.50) AS second_quart, 
+       Percentile_approx(tip_amount, 0.75) AS third_quart 
+FROM   ny_taxi_processed_orc;
+
+/*
+    avg_tip	    first_quart	    second_quart	third_quart
+ 	
+1	1.82	    0	            1.36	        2.45
+
+The average tip value (1.82) doesnt match or is close to the 50th Percentile value. So it is not a representative of the central tendency value. */
+    
+
+
+/* 5) Explore the ‘Extra’ (charge) variable - what fraction of total trips have an extra charge is levied?
+Using CASE statements which perform better than subqueries Ref: https://www.codeproject.com/Articles/63929/%2FArticles%2F63929%2FCorrelated-Sub-Query-vs-Case-Statement*/ 
+
+
+SELECT Count(*)                                                      AS total_trips,
+       Sum(CASE WHEN extra != 0 THEN 1 ELSE 0 END)                   AS trips_levied_extracharge,
+       Sum(CASE WHEN extra = 0 THEN 1 ELSE 0 END)                    AS trips_no_extracharge,
+       Round(Sum(CASE WHEN extra != 0 THEN 1 ELSE 0 END)/count(*),3) AS fraction_trips_with_extracharge
+FROM   ny_taxi_processed_orc;
+
+/* total_trips	trips_levied_extracharge	trips_no_extracharge	fraction_trips_extracharge
+ 	
+1	18480967	8524850	                    9956117	                0.461
+
+Around 46% of the trips were charged extra. This makes sense as there will be high demand during rush hours. */
+
+
+/*    ANALYSIS -II 
+
+    1) What is the correlation between the number of passengers on any given trip, and the tip paid per trip? 
+       Do multiple travellers tip more compared to solo travellers? Hint: Use CORR(Col_1, Col_2) */
+       
+SELECT Corr(passenger_count,tip_amount)                                 AS tip_passcount_corr,
+       Round(Avg(CASE WHEN passenger_count = 1 THEN tip_amount END),2)  AS avg_tip_by_solo_paasenger,
+       Round(Avg(CASE WHEN passenger_count <> 1 THEN tip_amount END),2) AS avg_tip_by_multiple_passenger
+FROM   ny_taxi_processed_orc;
+
+
+/*  tip_passcount_corr	    avg_tip_by_solo_paasenger	avg_tip_by_multiple_passenger
+ 	
+	-0.0046752281621738915	    1.83	                        1.8
+
+From the result table it is evident that there is no correlation between the passenger count and tip amount.
+The average tip amount is almost close for solo passengers and multiple passengers */
+
+       
+
+/*  2) Segregate the data into five segments of ‘tip paid’: [0-5), [5-10), [10-15) , [15-20) and >=20. 
+       Calculate the percentage share of each bucket (i.e. the fraction of trips falling in each bucket) */
+
+SELECT Count(*)                                                                                   AS total_trips,
+       Round(((Sum(CASE WHEN (tip_amount >= 0 AND tip_amount < 5) THEN 1 END)/Count(*))*100),2)   AS 0_to_5_percent_bucket,
+       Round(((Sum(CASE WHEN (tip_amount >= 5 AND tip_amount < 10) THEN 1 END)/Count(*))*100),2)  AS 5_to_10_percent_bucket,
+       Round(((Sum(CASE WHEN (tip_amount >= 10 AND tip_amount < 15) THEN 1 END)/Count(*))*100),2) AS 10_to_15_percent_bucket,
+       Round(((Sum(CASE WHEN (tip_amount >= 15 AND tip_amount < 20) THEN 1 END)/Count(*))*100),2) AS 15_to_20_percent_bucket,
+       Round(((Sum(CASE WHEN (tip_amount >= 20) THEN 1 END)/count(*))*100),2)                     AS grt_than_20_percent_bucket 
+FROM   ny_taxi_processed_orc;
+    
+/* RESULT :- 92.41% of the total trips had tip amount between 0 and 4$
+              5.62% of the total trips had tip amount between 5 and 9$
+              1.68% of the total trips had tip amount between 10 and 14$
+              0.19% of the total trips had tip amount between 15 and 19$
+              0.09% of the total trips had tip amount greater than equal to 20$ */
+              
+              
+              
+/*  3) Which month has a greater average ‘speed’ - November or December? Note that the variable ‘speed’ will have to be derived from other metrics. */
+        
+SELECT month(tpep_dropoff_datetime)                                                                                         AS mnth, 
+       Round(Avg(trip_distance/(unix_timestamp(tpep_dropoff_datetime)/3600 - unix_timestamp(tpep_pickup_datetime)/3600)),3) AS avg_speed_mph
+FROM   ny_taxi_processed_orc
+GROUP BY month(tpep_dropoff_datetime);
+
+/*
+ 	mnth	avg_speed_mph
+1	11	    12.695
+2	12	    12.625
+
+The average speed of trips in the month of November is higher than December by a very very small margin. */
+
+/*
+    4) Analyse the average speed of the most happening days of the year, i.e. 31st December (New year’s eve) and 25th December (Christmas Eve) and compare it with the overall average. */
+
+SELECT Round(Avg(trip_distance/(unix_timestamp(tpep_dropoff_datetime)/3600 - unix_timestamp(tpep_pickup_datetime)/3600)),3)                                                     AS overall_avg_speed,
+       Round(Avg(CASE WHEN mnth = 12 AND day_of_mnth = 25 THEN (trip_distance/(unix_timestamp(tpep_dropoff_datetime)/3600 - unix_timestamp(tpep_pickup_datetime)/3600)) END),3) AS avg_speed_25th_Dec,
+       Round(Avg(CASE WHEN mnth = 12 AND day_of_mnth = 31 THEN (trip_distance/(unix_timestamp(tpep_dropoff_datetime)/3600 - unix_timestamp(tpep_pickup_datetime)/3600)) END),3) AS avg_speed_31st_Dec
+FROM   ny_taxi_processed_orc;
+
+
+/* overall_avg_speed	avg_speed_25th_dec	avg_speed_31st_dec
+ 	
+1	12.659	                16.859	            14.091
+
+Speed on 25th Dec is bit higher than 31st Dec.
+Also from the result table it is clear that the average speed is higher on important days than normal days . */
+       
+
